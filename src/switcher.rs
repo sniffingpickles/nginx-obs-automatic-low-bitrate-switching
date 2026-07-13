@@ -306,10 +306,21 @@ impl Switcher {
             switch_scene, switch_type
         );
 
-        let state = &self.state.read().await;
+        let state = self.state.read().await;
         let current_scene = &state.broadcasting_software.current_scene;
 
         if current_scene == switch_scene {
+            return Ok(());
+        }
+
+        // A switch to this scene has already been requested and OBS
+        // hasn't confirmed the change yet (e.g. while a long stinger
+        // transition is still playing out). Avoid sending a duplicate
+        // request and a duplicate chat announcement; the pending switch
+        // is cleared once `CurrentProgramSceneChanged` is received, or
+        // after `PENDING_SWITCH_TIMEOUT` if that confirmation never
+        // arrives.
+        if state.broadcasting_software.is_switch_pending(switch_scene) {
             return Ok(());
         }
 
@@ -352,14 +363,29 @@ impl Switcher {
 
         info!("Scene switched to [{:?}] {}", switch_type, switch_scene);
 
-        if state.broadcasting_software.is_streaming
-            && state.config.switcher.auto_switch_notification
-            && let Some(chat) = &state.config.chat
-        {
+        let should_announce = state.broadcasting_software.is_streaming
+            && state.config.switcher.auto_switch_notification;
+        let chat_info = state
+            .config
+            .chat
+            .as_ref()
+            .map(|chat| (chat.platform.kind(), chat.username.to_owned()));
+
+        drop(state);
+
+        // The request was accepted by OBS; treat it as pending (not yet
+        // completed) until confirmed by `CurrentProgramSceneChanged`.
+        self.state
+            .write()
+            .await
+            .broadcasting_software
+            .set_pending_switch(switch_scene.to_owned());
+
+        if should_announce && let Some((platform, channel)) = chat_info {
             let message =
                 chat::HandleMessage::AutomaticSwitchingScene(chat::AutomaticSwitchingScene {
-                    platform: chat.platform.kind(),
-                    channel: chat.username.to_owned(),
+                    platform,
+                    channel,
                     scene: switch_scene.to_owned(),
                     switch_type,
                 });
@@ -480,4 +506,326 @@ pub enum SwitchType {
     Low,
     Previous,
     Offline,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{broadcasting_software::BroadcastingSoftwareLogic, config, state};
+    use std::{
+        collections::HashSet,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tokio::sync::mpsc;
+
+    /// A fake broadcasting software connection that records every scene it
+    /// was asked to switch to. Cloning shares the same recorded state, so a
+    /// handle can be kept in the test after the original is moved into
+    /// `BroadcastingSoftwareState::connection`.
+    #[derive(Clone)]
+    struct FakeObs {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_next: Arc<AtomicBool>,
+    }
+
+    impl FakeObs {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail_next: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Makes the next `switch_scene` call fail, simulating a genuine
+        /// OBS-side failure (as opposed to a duplicate we should suppress).
+        fn fail_next_call(&self) {
+            self.fail_next.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BroadcastingSoftwareLogic for FakeObs {
+        async fn switch_scene(&self, scene: &str) -> Result<String, error::Error> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(error::Error::NoSourceFound);
+            }
+
+            self.calls.lock().unwrap().push(scene.to_string());
+            Ok(scene.to_string())
+        }
+
+        async fn start_streaming(&self) -> Result<(), error::Error> {
+            Ok(())
+        }
+
+        async fn stop_streaming(&self) -> Result<(), error::Error> {
+            Ok(())
+        }
+
+        async fn toggle_recording(&self) -> Result<(), error::Error> {
+            Ok(())
+        }
+
+        async fn is_recording(&self) -> Result<bool, error::Error> {
+            Ok(false)
+        }
+
+        async fn fix(&self) -> Result<(), error::Error> {
+            Ok(())
+        }
+
+        async fn current_scene(&self) -> Result<String, error::Error> {
+            Ok(String::new())
+        }
+
+        async fn toggle_source(&self, _source: &str) -> Result<(String, bool), error::Error> {
+            Ok((String::new(), false))
+        }
+
+        async fn set_collection_and_profile(
+            &self,
+            _source: &config::CollectionPair,
+        ) -> Result<(), error::Error> {
+            Ok(())
+        }
+
+        async fn info(
+            &self,
+            _state: &tokio::sync::RwLockReadGuard<state::State>,
+        ) -> Result<state::StreamStatus, error::Error> {
+            Ok(state::StreamStatus::default())
+        }
+    }
+
+    /// Builds a `Switcher` wired up to `fake` with `current_scene` already
+    /// set, plus a receiver to observe automatic-switch chat announcements.
+    fn build_switcher(
+        fake: FakeObs,
+        current_scene: &str,
+    ) -> (Switcher, mpsc::Receiver<chat::HandleMessage>) {
+        let config = config::Config {
+            user: config::User {
+                id: None,
+                name: "test".to_string(),
+                password_hash: None,
+            },
+            switcher: config::Switcher {
+                auto_switch_notification: true,
+                ..Default::default()
+            },
+            software: config::SoftwareConnection::Obs(config::ObsConfig {
+                host: "localhost".to_string(),
+                password: None,
+                port: 4455,
+                collections: None,
+            }),
+            chat: Some(config::Chat::default()),
+            optional_scenes: config::OptionalScenes::default(),
+            optional_options: config::OptionalOptions::default(),
+            log_to_file: true,
+        };
+
+        let mut switcher_state = state::SwitcherState::default();
+        switcher_state.switchable_scenes =
+            HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()]);
+
+        let mut broadcasting_software = state::BroadcastingSoftwareState::default();
+        broadcasting_software.current_scene = current_scene.to_string();
+        broadcasting_software.is_streaming = true;
+        broadcasting_software.status = state::ClientStatus::Connected;
+        broadcasting_software.connection = Some(Box::new(fake));
+
+        let state = Arc::new(tokio::sync::RwLock::new(state::State {
+            config,
+            switcher_state,
+            broadcasting_software,
+            event_senders: Vec::new(),
+        }));
+
+        let (chat_tx, chat_rx) = mpsc::channel(10);
+
+        (
+            Switcher {
+                state,
+                chat_sender: chat_tx,
+            },
+            chat_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn immediate_switch_sends_request_and_announces_once() {
+        let fake = FakeObs::new();
+        let (switcher, mut chat_rx) = build_switcher(fake.clone(), "a");
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+        assert!(chat_rx.try_recv().is_ok(), "expected one announcement");
+    }
+
+    #[tokio::test]
+    async fn already_on_target_scene_is_a_no_op() {
+        let fake = FakeObs::new();
+        let (switcher, mut chat_rx) = build_switcher(fake.clone(), "b");
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+
+        assert!(fake.calls().is_empty());
+        assert!(chat_rx.try_recv().is_err());
+    }
+
+    /// Regression test for a long OBS transition (e.g. a stinger): OBS
+    /// accepts `SetCurrentProgramScene`, but `current_scene` doesn't update
+    /// until the transition actually finishes. Repeated polling cycles
+    /// during that window must not send duplicate requests or duplicate
+    /// announcements.
+    #[tokio::test]
+    async fn duplicate_switch_suppressed_while_transition_pending() {
+        let fake = FakeObs::new();
+        let (switcher, mut chat_rx) = build_switcher(fake.clone(), "a");
+
+        // 1 & 2: NOALBS decides to switch A -> B; SetCurrentProgramScene
+        // succeeds.
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+        assert!(chat_rx.try_recv().is_ok(), "expected one announcement");
+
+        // 3 & 4: OBS does not immediately report scene B as current (the
+        // transition is still playing out), and several polling cycles
+        // occur while it's still active.
+        for _ in 0..3 {
+            switcher
+                .switch_if_necessary("b", SwitchType::Normal)
+                .await
+                .unwrap();
+        }
+
+        // 5 & 6: must not have sent another identical request or repeated
+        // the announcement.
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+        assert!(
+            chat_rx.try_recv().is_err(),
+            "must not repeat the announcement while the switch is pending"
+        );
+
+        // 7: the transition ends / `CurrentProgramSceneChanged` reports
+        // scene B (this is what the real event handler does).
+        {
+            let mut state = switcher.state.write().await;
+            state.broadcasting_software.current_scene = "b".to_string();
+            state.broadcasting_software.clear_pending_switch();
+        }
+
+        // 8: back to normal operation -- already on the target scene, so
+        // this is a no-op.
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+
+        // 9: a later legitimate switch to a new scene must still work.
+        switcher
+            .switch_if_necessary("c", SwitchType::Low)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string(), "c".to_string()]);
+        assert!(chat_rx.try_recv().is_ok(), "the new switch should announce");
+    }
+
+    #[tokio::test]
+    async fn different_target_scene_is_not_blocked_by_a_pending_switch() {
+        let fake = FakeObs::new();
+        let (switcher, _chat_rx) = build_switcher(fake.clone(), "a");
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+
+        // A different target is requested while the switch to "b" is still
+        // pending (current_scene is still "a" in this fixture).
+        switcher
+            .switch_if_necessary("c", SwitchType::Low)
+            .await
+            .unwrap();
+
+        assert_eq!(fake.calls(), vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pending_switch_times_out_and_allows_retry() {
+        let fake = FakeObs::new();
+        let (switcher, _chat_rx) = build_switcher(fake.clone(), "a");
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+
+        // Simulate the confirmation event never arriving (e.g. a dropped
+        // connection) for long enough that the pending switch goes stale.
+        {
+            let mut state = switcher.state.write().await;
+            state.broadcasting_software.pending_switch = Some(state::PendingSwitch {
+                scene: "b".to_string(),
+                requested_at: std::time::Instant::now()
+                    - (state::BroadcastingSoftwareState::PENDING_SWITCH_TIMEOUT
+                        + Duration::from_secs(1)),
+            });
+        }
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string(), "b".to_string()]);
+    }
+
+    /// A genuine failure (as opposed to a duplicate while pending) must not
+    /// be treated as accepted, so retry behavior for real failures is
+    /// unaffected.
+    #[tokio::test]
+    async fn failed_switch_does_not_set_pending_and_can_retry() {
+        let fake = FakeObs::new();
+        fake.fail_next_call();
+        let (switcher, mut chat_rx) = build_switcher(fake.clone(), "a");
+
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert!(
+            fake.calls().is_empty(),
+            "a failed call must not be recorded as accepted"
+        );
+        assert!(chat_rx.try_recv().is_err());
+
+        // Retry immediately -- must not be blocked by a bogus pending
+        // state left over from the failed attempt.
+        switcher
+            .switch_if_necessary("b", SwitchType::Normal)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls(), vec!["b".to_string()]);
+        assert!(chat_rx.try_recv().is_ok());
+    }
 }

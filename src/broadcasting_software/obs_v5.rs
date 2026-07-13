@@ -83,6 +83,12 @@ impl Obsv5 {
                     }
 
                     l.broadcasting_software.current_scene = name;
+
+                    // The program scene has now actually changed (this may
+                    // have been delayed by a long transition, e.g. a
+                    // stinger), so any switch we were waiting to see
+                    // confirmed is no longer pending.
+                    l.broadcasting_software.clear_pending_switch();
                 }
                 Event::StreamStateChanged { active, .. } => {
                     let mut l = user_state.write().await;
@@ -656,9 +662,7 @@ impl InnerConnection {
 
             {
                 let state = &mut self.state.write().await;
-                let bs = &mut state.broadcasting_software;
-                bs.status = ClientStatus::Disconnected;
-                bs.is_streaming = false;
+                state.broadcasting_software.mark_disconnected();
             }
         }
     }
@@ -759,4 +763,127 @@ pub struct VlcSource {
 pub struct SlideshowFile {
     /// Location of the file to display.
     pub value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use obws::responses::{scenes::SceneId, transitions::TransitionId};
+    use std::collections::HashSet;
+
+    /// Builds user state with a switch to "live" already marked pending,
+    /// starting on scene "starting".
+    fn build_state() -> noalbs::UserState {
+        let config = config::Config {
+            user: config::User {
+                id: None,
+                name: "test".to_string(),
+                password_hash: None,
+            },
+            switcher: config::Switcher::default(),
+            software: config::SoftwareConnection::Obs(config::ObsConfig {
+                host: "localhost".to_string(),
+                password: None,
+                port: 4455,
+                collections: None,
+            }),
+            chat: None,
+            optional_scenes: config::OptionalScenes::default(),
+            optional_options: config::OptionalOptions::default(),
+            log_to_file: true,
+        };
+
+        let mut switcher_state = state::SwitcherState::default();
+        switcher_state.switchable_scenes = HashSet::from(["live".to_string(), "low".to_string()]);
+
+        let mut broadcasting_software = state::BroadcastingSoftwareState::default();
+        broadcasting_software.current_scene = "starting".to_string();
+        broadcasting_software.set_pending_switch("live".to_string());
+
+        Arc::new(sync::RwLock::new(state::State {
+            config,
+            switcher_state,
+            broadcasting_software,
+            event_senders: Vec::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn current_program_scene_changed_clears_a_matching_pending_switch() {
+        let user_state = build_state();
+        let (tx, rx) = mpsc::channel(10);
+
+        tx.send(Event::CurrentProgramSceneChanged {
+            id: SceneId {
+                name: "live".to_string(),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        Obsv5::event_handler(rx, user_state.clone()).await;
+
+        let state = user_state.read().await;
+        assert_eq!(state.broadcasting_software.current_scene, "live");
+        assert!(!state.broadcasting_software.is_switch_pending("live"));
+    }
+
+    /// Even if `CurrentProgramSceneChanged` reports a scene other than the
+    /// one that was pending (e.g. someone changed scenes manually in OBS
+    /// while a switch was in flight), the stale pending switch must not be
+    /// left blocking future requests.
+    #[tokio::test]
+    async fn current_program_scene_changed_to_a_different_scene_still_clears_pending() {
+        let user_state = build_state();
+        let (tx, rx) = mpsc::channel(10);
+
+        tx.send(Event::CurrentProgramSceneChanged {
+            id: SceneId {
+                name: "low".to_string(),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        Obsv5::event_handler(rx, user_state.clone()).await;
+
+        let state = user_state.read().await;
+        assert_eq!(state.broadcasting_software.current_scene, "low");
+        assert!(!state.broadcasting_software.is_switch_pending("live"));
+    }
+
+    /// `SceneTransitionStarted`/`SceneTransitionEnded` aren't subscribed to
+    /// (see `EventSubscription::SCENES | EventSubscription::OUTPUTS` in
+    /// `InnerConnection::run`), but if they were ever received they must not
+    /// panic and must not clear a pending switch on their own -- only the
+    /// scene actually changing (`CurrentProgramSceneChanged`) should do
+    /// that.
+    #[tokio::test]
+    async fn scene_transition_events_do_not_clear_pending_switch() {
+        let user_state = build_state();
+        let (tx, rx) = mpsc::channel(10);
+
+        tx.send(Event::SceneTransitionStarted {
+            id: TransitionId::default(),
+        })
+        .await
+        .unwrap();
+        tx.send(Event::SceneTransitionEnded {
+            id: TransitionId::default(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        Obsv5::event_handler(rx, user_state.clone()).await;
+
+        let state = user_state.read().await;
+        assert_eq!(state.broadcasting_software.current_scene, "starting");
+        assert!(state.broadcasting_software.is_switch_pending("live"));
+    }
 }

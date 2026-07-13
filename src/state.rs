@@ -86,6 +86,12 @@ pub struct BroadcastingSoftwareState {
     pub initial_stream_status: Option<StreamStatus>,
     pub stream_status: Option<StreamStatus>,
 
+    /// A scene switch request that was accepted by the broadcasting
+    /// software but not yet confirmed as the current scene. Used to avoid
+    /// sending duplicate switch requests / announcements while a long
+    /// transition (e.g. a stinger) is still playing out.
+    pub pending_switch: Option<PendingSwitch>,
+
     // TODO?
     pub connection: Option<Box<dyn BroadcastingSoftwareLogic>>,
 
@@ -95,6 +101,13 @@ pub struct BroadcastingSoftwareState {
 }
 
 impl BroadcastingSoftwareState {
+    /// How long a requested scene switch is considered "pending" before
+    /// it's treated as stale and eligible to be retried. This is the
+    /// safety net for missed/late confirmation events (e.g. a dropped
+    /// connection), and should comfortably exceed any expected transition
+    /// duration.
+    pub const PENDING_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub fn connected_notifier(&self) -> Arc<Notify> {
         self.connected_notifier.clone()
     }
@@ -106,6 +119,41 @@ impl BroadcastingSoftwareState {
     pub fn switch_scene_notifier(&self) -> Arc<Notify> {
         self.switch_scene_notifier.clone()
     }
+
+    /// Whether a switch to `scene` was already requested and is still
+    /// within the timeout window, i.e. it doesn't need to be requested
+    /// again.
+    pub fn is_switch_pending(&self, scene: &str) -> bool {
+        self.pending_switch.as_ref().is_some_and(|pending| {
+            pending.scene == scene && pending.requested_at.elapsed() < Self::PENDING_SWITCH_TIMEOUT
+        })
+    }
+
+    pub fn set_pending_switch(&mut self, scene: String) {
+        self.pending_switch = Some(PendingSwitch {
+            scene,
+            requested_at: std::time::Instant::now(),
+        });
+    }
+
+    pub fn clear_pending_switch(&mut self) {
+        self.pending_switch = None;
+    }
+
+    /// Resets connection-dependent state after OBS disconnects. Any
+    /// in-flight switch can no longer be confirmed by an event, so it
+    /// must not be left pending until the timeout.
+    pub fn mark_disconnected(&mut self) {
+        self.status = ClientStatus::Disconnected;
+        self.is_streaming = false;
+        self.clear_pending_switch();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSwitch {
+    pub scene: String,
+    pub requested_at: std::time::Instant,
 }
 
 impl std::fmt::Debug for BroadcastingSoftwareState {
@@ -134,6 +182,7 @@ impl Default for BroadcastingSoftwareState {
             last_stream_started_at: std::time::Instant::now(),
             stream_status: None,
             initial_stream_status: None,
+            pending_switch: None,
         }
     }
 }
@@ -196,5 +245,80 @@ impl BroadcastClient {
         if self.tx_chan.send(json).is_err() {
             // Disconnected.. should be handled in reader
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn no_pending_switch_by_default() {
+        let bs = BroadcastingSoftwareState::default();
+        assert!(!bs.is_switch_pending("live"));
+    }
+
+    #[test]
+    fn switch_is_pending_right_after_being_set() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.set_pending_switch("live".to_string());
+
+        assert!(bs.is_switch_pending("live"));
+    }
+
+    #[test]
+    fn a_different_scene_is_not_considered_pending() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.set_pending_switch("live".to_string());
+
+        assert!(!bs.is_switch_pending("low"));
+    }
+
+    #[test]
+    fn pending_switch_expires_after_the_timeout() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.pending_switch = Some(PendingSwitch {
+            scene: "live".to_string(),
+            requested_at: std::time::Instant::now()
+                - (BroadcastingSoftwareState::PENDING_SWITCH_TIMEOUT + Duration::from_secs(1)),
+        });
+
+        assert!(!bs.is_switch_pending("live"));
+    }
+
+    #[test]
+    fn pending_switch_is_still_pending_just_before_the_timeout() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.pending_switch = Some(PendingSwitch {
+            scene: "live".to_string(),
+            requested_at: std::time::Instant::now()
+                - (BroadcastingSoftwareState::PENDING_SWITCH_TIMEOUT - Duration::from_secs(1)),
+        });
+
+        assert!(bs.is_switch_pending("live"));
+    }
+
+    #[test]
+    fn clear_pending_switch_removes_it() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.set_pending_switch("live".to_string());
+        bs.clear_pending_switch();
+
+        assert!(!bs.is_switch_pending("live"));
+    }
+
+    #[test]
+    fn mark_disconnected_clears_pending_switch_and_state() {
+        let mut bs = BroadcastingSoftwareState::default();
+        bs.status = ClientStatus::Connected;
+        bs.is_streaming = true;
+        bs.set_pending_switch("live".to_string());
+
+        bs.mark_disconnected();
+
+        assert_eq!(bs.status, ClientStatus::Disconnected);
+        assert!(!bs.is_streaming);
+        assert!(!bs.is_switch_pending("live"));
     }
 }
